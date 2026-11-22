@@ -14,6 +14,14 @@ export function createDatabase(connectionString) {
   }
 
   return {
+    async query(text, values) {
+      if (!pool) throw new Error('DATABASE_URL is not configured');
+      return pool.query(text, values);
+    },
+    async connect() {
+      if (!pool) throw new Error('DATABASE_URL is not configured');
+      return pool.connect();
+    },
     async checkConnection() {
       if (!pool) {
         throw new Error('DATABASE_URL is not configured');
