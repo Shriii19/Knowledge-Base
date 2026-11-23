@@ -1,59 +1,51 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
-import { randomUUID } from 'node:crypto';
 import express from 'express';
-import cookieParser from 'cookie-parser';
 import { createApp } from '../src/app.js';
 import { authentication, requireRoles } from '../src/middleware/auth.js';
 
-const secret = 'test-secret-with-at-least-32-bytes-long';
 const origin = 'http://localhost:5173';
 const password = 'correct-horse-battery-staple';
+const profile = (role) => ({
+  id: role, full_name: role, email: `${role.toLowerCase()}@example.test`, role,
+  is_active: true, created_at: new Date().toISOString()
+});
 
-function fakeDatabase(users) {
-  const sessions = new Map();
-  const publicUser = ({ password_hash, ...user }) => user;
-  const result = (rows) => ({ rows, rowCount: rows.length });
-  async function query(sql, values = []) {
-    if (/^(BEGIN|COMMIT|ROLLBACK|SELECT pg_advisory_xact_lock)/.test(sql)) return result([]);
-    if (sql.includes('FROM users u LEFT JOIN auth_sessions')) {
-      const session = sessions.get(values[1]);
-      const user = users.find((item) => item.id === values[0]);
-      return result(user ? [{ ...publicUser(user), session_id: session?.userId === user.id && session.expires > Date.now() ? values[1] : null }] : []);
+function doubles() {
+  const users = new Map(['ADMIN', 'EDITOR', 'TECHNICIAN'].map((role) => [role, profile(role)]));
+  const tokens = new Map([...users.keys()].map((id) => [id, { uid: id, auth_time: 100 }]));
+  const identity = {
+    async verifyIdToken(token, checkRevoked) {
+      assert.equal(checkRevoked, true);
+      if (token === 'failure') throw Object.assign(new Error('service failure'), { code: 'auth/internal-error' });
+      if (!tokens.has(token)) throw Object.assign(new Error('invalid'), { code: 'auth/invalid-id-token' });
+      return tokens.get(token);
+    },
+    async createUser({ email }) {
+      if ([...users.values()].some((user) => user.email === email)) throw Object.assign(new Error('duplicate'), { code: 'auth/email-already-exists' });
+      return { uid: 'new-user' };
+    },
+    async deleteUser(id) { this.deleted = id; }
+  };
+  const store = {
+    async checkConnection() {},
+    async getUser(id) { return users.get(id); },
+    async listUsers({ role }) { return [...users.values()].filter((user) => !role || role === user.role); },
+    async createUser(actor, user) {
+      if (users.get(actor)?.role !== 'ADMIN') throw Object.assign(new Error('forbidden'), { code: 'FORBIDDEN' });
+      users.set(user.id, user);
+    },
+    async updateUser(actor, id, changes) {
+      if (users.get(actor)?.role !== 'ADMIN') throw Object.assign(new Error('forbidden'), { code: 'FORBIDDEN' });
+      const user = users.get(id);
+      if (!user) throw Object.assign(new Error('missing'), { code: 'NOT_FOUND' });
+      if (user.role === 'ADMIN' && (changes.role && changes.role !== 'ADMIN' || changes.isActive === false))
+        throw Object.assign(new Error('last admin'), { code: 'LAST_ADMIN' });
+      Object.assign(user, changes.role && { role: changes.role }, changes.isActive !== undefined && { is_active: changes.isActive });
+      return user;
     }
-    if (sql.startsWith('SELECT * FROM users WHERE lower(email)')) return result(users.filter((user) => user.email === values[0]));
-    if (sql.includes('INSERT INTO auth_sessions')) {
-      const user = users.find((item) => item.id === values[0] && item.is_active);
-      if (!user) return result([]);
-      user.last_login_at = new Date().toISOString();
-      sessions.set(values[1], { userId: user.id, expires: Date.now() + 28800000 });
-      return result([{ id: values[1] }]);
-    }
-    if (sql.startsWith('DELETE FROM auth_sessions WHERE id')) { sessions.delete(values[0]); return result([]); }
-    if (sql.startsWith('DELETE FROM auth_sessions WHERE user_id')) {
-      for (const [id, session] of sessions) if (session.userId === values[0]) sessions.delete(id);
-      return result([]);
-    }
-    if (sql.startsWith('SELECT 1 FROM users WHERE id')) return result(users.filter((user) => user.id === values[0] && user.role === 'ADMIN' && user.is_active).map(() => ({ '?column?': 1 })));
-    if (sql.startsWith('SELECT id, role, is_active FROM users')) return result(users.filter((user) => user.id === values[0]));
-    if (sql.startsWith('SELECT count(*)')) return result([{ count: users.filter((user) => user.role === 'ADMIN' && user.is_active).length }]);
-    if (sql.startsWith('UPDATE users SET role')) {
-      const user = users.find((item) => item.id === values[0]);
-      user.role = values[1]; user.is_active = values[2]; user.updated_at = new Date().toISOString();
-      return result([publicUser(user)]);
-    }
-    if (sql.startsWith('INSERT INTO users')) {
-      if (users.some((user) => user.email === values[1])) { const error = new Error('duplicate'); error.code = '23505'; throw error; }
-      const user = { id: randomUUID(), full_name: values[0], email: values[1], password_hash: values[2], role: values[3], is_active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), last_login_at: null };
-      users.push(user);
-      return result([publicUser(user)]);
-    }
-    if (sql.startsWith('SELECT id, full_name, email, role, is_active')) return result(users.filter((user) => (!values[0] || `${user.full_name} ${user.email}`.toLowerCase().includes(values[0].toLowerCase())) && (!values[1] || user.role === values[1])).map(publicUser));
-    throw new Error(`Unexpected test query: ${sql}`);
-  }
-  return { query, connect: async () => ({ query, release() {} }), sessions };
+  };
+  return { users, tokens, identity, store };
 }
 
 async function serve(app, run) {
@@ -63,108 +55,67 @@ async function serve(app, run) {
   finally { await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); }
 }
 
-test('authentication, live role enforcement, user administration and session security', async () => {
-  const hash = await bcrypt.hash(password, 10);
-  const users = ['ADMIN', 'EDITOR', 'TECHNICIAN'].map((role) => ({
-    id: randomUUID(), full_name: role, email: `${role.toLowerCase()}@example.test`, password_hash: hash,
-    role, is_active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), last_login_at: null
-  }));
-  const disabled = { ...users[2], id: randomUUID(), email: 'disabled@example.test', is_active: false };
-  users.push(disabled);
-  const database = fakeDatabase(users);
-  const app = createApp({ database, corsOrigin: origin, jwtSecret: secret });
-  await serve(app, async (base) => {
-    const request = (path, { method = 'GET', body, cookie, ...options } = {}) => fetch(base + path, {
-      method, headers: { Origin: origin, 'X-Requested-With': 'KnowledgeBase', ...(body && { 'Content-Type': 'application/json' }), ...(cookie && { Cookie: cookie }) },
-      ...(body && { body: JSON.stringify(body) }), ...options
+test('verified tokens, live roles and administrator-only user management', async () => {
+  const { identity, store, users, tokens } = doubles();
+  await serve(createApp({ identity, store, corsOrigin: origin }), async (base) => {
+    const request = (path, token, method = 'GET', body) => fetch(base + path, {
+      method, headers: { ...(token && { Authorization: `Bearer ${token}` }), ...(body && { 'Content-Type': 'application/json' }) },
+      ...(body && { body: JSON.stringify(body) })
     });
-    const login = async (email, value = password) => request('/api/auth/login', { method: 'POST', body: { email, password: value } });
-
-    assert.equal((await request('/api/users')).status, 401);
-    assert.equal((await login('not-an-email')).status, 400);
-    assert.equal((await login('missing@example.test')).status, 401);
-    assert.equal((await login('admin@example.test', 'wrong-password')).status, 401);
-    const inactive = await login('disabled@example.test');
-    assert.equal(inactive.status, 403);
-    assert.equal((await inactive.json()).code, 'ACCOUNT_DISABLED');
-
-    const cookies = {};
+    assert.equal((await request('/api/auth/me')).status, 401);
+    assert.equal((await request('/api/auth/me', 'invalid')).status, 401);
+    assert.equal((await request('/api/auth/me', 'failure')).status, 500);
+    tokens.set('no-profile', { uid: 'no-profile', role: 'ADMIN', auth_time: 100 });
+    assert.equal((await request('/api/users', 'no-profile')).status, 403);
     for (const role of ['ADMIN', 'EDITOR', 'TECHNICIAN']) {
-      const response = await login(`${role.toLowerCase()}@example.test`);
-      assert.equal(response.status, 200);
-      assert.match(response.headers.get('set-cookie'), /HttpOnly/i);
-      assert.match(response.headers.get('set-cookie'), /SameSite=Lax/i);
-      cookies[role] = response.headers.get('set-cookie').split(';')[0];
-      assert.equal((await request('/api/auth/me', { cookie: cookies[role] })).status, 200);
+      const me = await request('/api/auth/me', role);
+      assert.equal(me.status, 200);
+      assert.equal((await me.json()).user.role, role);
+      assert.equal((await request('/api/users', role)).status, role === 'ADMIN' ? 200 : 403);
     }
-    assert.equal((await request('/api/users', { cookie: cookies.ADMIN })).status, 200);
-    assert.equal((await request('/api/users', { cookie: cookies.EDITOR })).status, 403);
-    assert.equal((await request('/api/users', { cookie: cookies.TECHNICIAN })).status, 403);
-    assert.equal((await request(`/api/users/${users[2].id}`, { method: 'PATCH', cookie: cookies.EDITOR, body: { role: 'ADMIN' } })).status, 403);
-    assert.equal((await request(`/api/users/${users[0].id}`, { method: 'PATCH', cookie: cookies.ADMIN, body: { isActive: false } })).status, 409);
-    assert.equal((await request(`/api/users/${users[0].id}`, { method: 'PATCH', cookie: cookies.ADMIN, body: { role: 'EDITOR' } })).status, 409);
-    assert.equal((await request(`/api/users/${users[1].id}`, { method: 'PATCH', cookie: cookies.ADMIN, body: { role: 'TECHNICIAN' } })).status, 200);
-    assert.equal((await (await request('/api/auth/me', { cookie: cookies.EDITOR })).json()).user.role, 'TECHNICIAN');
-    assert.equal((await request(`/api/users/${users[2].id}`, { method: 'PATCH', cookie: cookies.ADMIN, body: { isActive: false } })).status, 200);
-    const disabledSession = await request('/api/auth/me', { cookie: cookies.TECHNICIAN });
-    assert.equal(disabledSession.status, 403);
-    assert.equal((await disabledSession.json()).code, 'ACCOUNT_DISABLED');
-    assert.equal((await request(`/api/users/${users[2].id}`, { method: 'PATCH', cookie: cookies.ADMIN, body: { isActive: true } })).status, 200);
-    assert.equal((await request('/api/auth/me', { cookie: cookies.TECHNICIAN })).status, 401);
-    const created = await request('/api/users', { method: 'POST', cookie: cookies.ADMIN, body: { fullName: 'New User', email: 'NEW@example.test', password, role: 'EDITOR' } });
+    tokens.get('TECHNICIAN').role = 'ADMIN';
+    const create = { fullName: 'New User', email: 'NEW@example.test', password, role: 'EDITOR' };
+    assert.equal((await request('/api/users', 'TECHNICIAN', 'POST', create)).status, 403);
+    assert.equal((await request('/api/users/EDITOR', 'EDITOR', 'PATCH', { role: 'ADMIN' })).status, 403);
+    assert.equal((await request('/api/users/ADMIN', 'ADMIN', 'PATCH', { role: 'EDITOR' })).status, 409);
+    assert.equal((await request('/api/users/ADMIN', 'ADMIN', 'PATCH', { isActive: false })).status, 409);
+    assert.equal((await request('/api/users', 'ADMIN', 'POST', { ...create, isActive: true })).status, 400);
+    const created = await request('/api/users', 'ADMIN', 'POST', create);
     assert.equal(created.status, 201);
     assert.equal((await created.json()).user.email, 'new@example.test');
-    assert.equal((await request('/api/users', { method: 'POST', cookie: cookies.ADMIN, body: { fullName: 'New User', email: 'new@example.test', password, role: 'EDITOR' } })).status, 409);
-    assert.notEqual(users.at(-1).password_hash, password);
-    assert.equal((await request('/api/users?role=EDITOR', { cookie: cookies.ADMIN })).status, 200);
-    assert.equal((await request('/api/users', { method: 'POST', cookie: cookies.ADMIN, body: { fullName: 'Bad', email: 'x@example.test', password, role: 'ADMIN', isActive: true } })).status, 400);
-    const csrf = await fetch(base + '/api/auth/logout', { method: 'POST', headers: { Origin: 'https://attacker.example', 'X-Requested-With': 'KnowledgeBase', Cookie: cookies.ADMIN } });
-    assert.equal(csrf.status, 403);
-    const expired = jwt.sign({}, secret, { algorithm: 'HS256', subject: users[0].id, jwtid: randomUUID(), expiresIn: -1, issuer: 'kb-api', audience: 'kb-web' });
-    assert.equal((await request('/api/auth/me', { cookie: `kb_session=${expired}` })).status, 401);
-    assert.equal((await request('/api/auth/logout', { method: 'POST', cookie: cookies.ADMIN })).status, 200);
-    assert.equal((await request('/api/auth/me', { cookie: cookies.ADMIN })).status, 401);
+    assert.equal((await request('/api/users', 'ADMIN', 'POST', create)).status, 409);
+    assert.equal((await request('/api/users/EDITOR', 'ADMIN', 'PATCH', { role: 'TECHNICIAN' })).status, 200);
+    assert.equal((await (await request('/api/auth/me', 'EDITOR')).json()).user.role, 'TECHNICIAN');
+    users.get('TECHNICIAN').is_active = false;
+    assert.equal((await (await request('/api/auth/me', 'TECHNICIAN')).json()).code, 'ACCOUNT_DISABLED');
+    users.get('TECHNICIAN').is_active = true;
+    users.get('TECHNICIAN').sessions_valid_after = 100;
+    assert.equal((await request('/api/auth/me', 'TECHNICIAN')).status, 401);
+    tokens.get('TECHNICIAN').auth_time = 101;
+    assert.equal((await request('/api/auth/me', 'TECHNICIAN')).status, 200);
   });
 });
 
-test('role middleware rejects technician from a representative editor-only route', async () => {
-  const user = { id: randomUUID(), full_name: 'Technician', email: 'tech@example.test', role: 'TECHNICIAN', is_active: true };
-  const database = fakeDatabase([user]);
-  const sessionId = randomUUID();
-  database.sessions.set(sessionId, { userId: user.id, expires: Date.now() + 10000 });
-  const token = jwt.sign({}, secret, { algorithm: 'HS256', subject: user.id, jwtid: sessionId, expiresIn: 60, issuer: 'kb-api', audience: 'kb-web' });
+test('editor role middleware denies technicians', async () => {
+  const { identity, store } = doubles();
   const app = express();
-  app.use(cookieParser());
-  app.patch('/editor-only', authentication(database, secret), requireRoles('ADMIN', 'EDITOR'), (_req, res) => res.sendStatus(204));
+  app.get('/editor', authentication(identity, store), requireRoles('ADMIN', 'EDITOR'), (_req, res) => res.sendStatus(204));
   await serve(app, async (base) => {
-    const response = await fetch(`${base}/editor-only`, { method: 'PATCH', headers: { Cookie: `kb_session=${token}` } });
-    assert.equal(response.status, 403);
-  });
-});
-
-test('production sessions use secure cross-site cookies', async () => {
-  const hash = await bcrypt.hash(password, 10);
-  const user = { id: randomUUID(), full_name: 'Admin', email: 'admin@example.test', password_hash: hash, role: 'ADMIN', is_active: true };
-  await serve(createApp({ database: fakeDatabase([user]), corsOrigin: origin, jwtSecret: secret, production: true }), async (base) => {
-    const response = await fetch(`${base}/api/auth/login`, {
-      method: 'POST',
-      headers: { Origin: origin, 'X-Requested-With': 'KnowledgeBase', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: user.email, password })
-    });
-    assert.equal(response.status, 200);
-    assert.match(response.headers.get('set-cookie'), /;\s*Secure/i);
-    assert.match(response.headers.get('set-cookie'), /SameSite=None/i);
-  });
-});
-
-test('login attempts are limited', async () => {
-  const database = fakeDatabase([]);
-  await serve(createApp({ database, corsOrigin: origin, jwtSecret: secret }), async (base) => {
-    for (let i = 0; i < 10; i++) {
-      const response = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { Origin: origin, 'X-Requested-With': 'KnowledgeBase', 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'missing@example.test', password: 'bad-password' }) });
-      assert.equal(response.status, 401);
+    for (const [role, status] of [['ADMIN', 204], ['EDITOR', 204], ['TECHNICIAN', 403]]) {
+      assert.equal((await fetch(`${base}/editor`, { headers: { Authorization: `Bearer ${role}` } })).status, status);
     }
-    const response = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { Origin: origin, 'X-Requested-With': 'KnowledgeBase', 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'missing@example.test', password: 'bad-password' }) });
-    assert.equal(response.status, 429);
+  });
+});
+
+test('failed profile creation cleans up the new Firebase account', async () => {
+  const { identity, store } = doubles();
+  store.createUser = async () => { throw Object.assign(new Error('actor no longer authorized'), { code: 'FORBIDDEN' }); };
+  await serve(createApp({ identity, store, corsOrigin: origin }), async (base) => {
+    const response = await fetch(`${base}/api/users`, {
+      method: 'POST', headers: { Authorization: 'Bearer ADMIN', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fullName: 'New User', email: 'new@example.test', password, role: 'ADMIN' })
+    });
+    assert.equal(response.status, 403);
+    assert.equal(identity.deleted, 'new-user');
   });
 });
