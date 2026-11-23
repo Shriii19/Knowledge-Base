@@ -1,41 +1,34 @@
 # IT Support Knowledge Base
 
-Phase 2 adds authentication and administrator-managed users to the Phase 1 React/Vite, Express and PostgreSQL foundation. Articles, categories, approval, feedback and analytics are not implemented yet; their permissions must be enforced when those APIs are introduced.
+Phase 2 replaces the PostgreSQL authentication foundation with Firebase Authentication, Cloud Firestore and a trusted Express backend. This phase implements authentication and user management only. Article, category, approval, feedback, view and attachment functionality is deferred; the listed roles are not yet permissions for those future APIs.
 
 ## Requirements
 
 - Node.js 22.12 or newer and npm.
-- PostgreSQL 13 or later, such as a Neon database. `psql` is optional.
-- A long, randomly generated JWT secret.
+- A Firebase project on the free Spark plan, with Authentication and Cloud Firestore enabled.
+- Credentials for a trusted backend identity with permission to administer Firebase Authentication and read/write Firestore. Never put these credentials in frontend code or source control.
 
-## Local setup
+## Firebase configuration
 
-From the project root in PowerShell:
+1. In the Firebase console, create or select a project and register a web app. Copy its web configuration values for the frontend.
+2. Enable the Email/Password sign-in provider under Authentication. Configure authorized domains and the password-reset email template. Enable email enumeration protection; see [Firebase's documentation](https://cloud.google.com/identity-platform/docs/admin/email-enumeration-protection).
+3. Create a Firestore database in your chosen location. Deploy the restrictive rules in [firestore.rules](./firestore.rules) before using the application. For example, with the Firebase CLI authenticated to the correct project, run `firebase deploy --only firestore:rules --project YOUR_PROJECT_ID` from the repository root. Alternatively paste the rules into the Firestore Rules console and publish them.
+4. For local backend development, obtain a service-account JSON file using the Firebase console and store it outside the repository. Set `GOOGLE_APPLICATION_CREDENTIALS` to its absolute path. In deployed environments prefer an attached service account or workload identity using Application Default Credentials rather than distributing a key.
+5. From the project root:
 
-```powershell
-npm install
-Copy-Item backend\.env.example backend\.env
-```
+   ```powershell
+   npm install
+   Copy-Item backend\.env.example backend\.env
+   Copy-Item frontend\.env.example frontend\.env
+   ```
 
-In `backend\.env`, set `DATABASE_URL` to your Neon connection string, retaining its SSL settings (normally `sslmode=require`). Set `JWT_SECRET` to a random secret of at least 32 bytes; generate one locally with:
+   Set `FIREBASE_PROJECT_ID` and `GOOGLE_APPLICATION_CREDENTIALS` in `backend\.env`. Set the four `VITE_FIREBASE_*` values in `frontend\.env` from the web app configuration, using the same project. These web values identify the project and are public; they are not service-account credentials. Do not copy private keys into any `VITE_` variable. `CORS_ORIGIN` must exactly match the frontend origin, without a trailing slash. `VITE_API_BASE_URL` can be empty for the local Vite proxy.
 
-```powershell
-node -e "console.log(require('node:crypto').randomBytes(48).toString('base64'))"
-```
+The backend uses Application Default Credentials and `FIREBASE_PROJECT_ID`. `PORT` defaults to 3001. `TRUST_PROXY=1` is appropriate only behind exactly one trusted reverse proxy. In production, `CORS_ORIGIN` must be HTTPS, and `VITE_API_BASE_URL` must be the HTTPS backend URL ending in `/api`; configure hosting to rewrite frontend routes to `index.html`. Keep environment files and service-account keys private.
 
-Paste the result into `backend\.env` and keep it private. `CORS_ORIGIN` must exactly match the frontend origin, including protocol and port. Use `http://localhost:5173` locally. Never commit the `.env` file or share its contents.
+## Create the initial administrator
 
-## Migrations
-
-```powershell
-npm run migrate --workspace backend
-```
-
-The migration runner tracks applied files in `schema_migrations`, serializes concurrent runs and applies each file transactionally. `001_users.sql` creates `users` and revocable `auth_sessions`, with UUID keys, a case-insensitive unique email index, role constraints and timestamps. It deliberately fails if a `users` table already exists rather than altering or dropping unknown data. Phase 1 had no user schema; if your database already contains one, inspect it and prepare a compatible data-preserving migration before running this command. Back up existing data first. The database user needs permission to create tables and indexes.
-
-## Create the first administrator
-
-After migration, run the following in a PowerShell terminal. Enter the password privately when prompted; it must contain at least 12 characters and no more than 72 UTF-8 bytes.
+Run this **only on a trusted machine** with backend credentials configured. Setup creates a Firebase Auth account and its Firestore profile and succeeds only when the application has no users and has not already been initialized. It does not take over an existing Firebase Auth account. Enter the password privately; it must contain at least 12 characters and at most 72 UTF-8 bytes.
 
 ```powershell
 $env:ADMIN_NAME = Read-Host "Administrator name"
@@ -51,42 +44,40 @@ try {
 }
 ```
 
-The setup command only succeeds when the users table is empty, hashes the password with bcrypt, and creates no public registration endpoint. Use user management to add subsequent accounts. Share initial passwords through an approved secure channel; password resets and self-service password changes are not yet implemented.
+An authenticated administrator can create subsequent accounts, including administrators, from User management. Share initial passwords through an approved secure channel. Users can request a password-reset email from the sign-in page. If creation fails and the server logs report an orphaned Firebase account, inspect and remove that account in the Firebase console before retrying.
 
-## Run and sign in
+## Run
 
-Start these commands in separate terminals from the project root:
+Start these commands in separate terminals:
 
 ```powershell
 npm run dev:backend
 npm run dev:frontend
 ```
 
-Open `http://localhost:5173` and sign in with the administrator email and password supplied above. Administrators can create users, filter/search accounts, change roles and activate or deactivate accounts. The last active administrator cannot be deactivated or demoted. Editors and technicians can sign in and view their profile, but article functionality is deferred. Access is checked on the server for every protected API request; roles are read from the database, not the JWT.
+Open `http://localhost:5173`. Firebase persists sign-in locally in the browser; sign out on shared devices. The API verifies Firebase ID tokens, checks revocation, and reads the user's current Firestore profile and role on each protected request. Deactivation blocks API access immediately; after reactivation, sessions authenticated before deactivation remain invalid and the user must sign in again. Firebase sign-out removes the local session; it does not invalidate a stolen ID token by itself.
 
-Vite proxies `/api` to port 3001. Update `frontend\vite.config.js` if changing the backend port. The protected system-status page retains the Phase 1 API and database checks. `GET /api/health` is public and `GET /api/health/database` runs `SELECT 1`; database errors are not sent to clients.
+The existing system-status page checks the public API and Firestore readiness endpoint. User management searches all profiles and returns up to 200 matches; reads grow with the number of users. Firestore charges and free-tier quotas apply.
 
-## Security and deployment
+## Roles and security
 
-- The eight-hour JWT is in an HTTP-only cookie; server-side sessions are revoked on logout or account deactivation. Role and account status are rechecked on each request. Cookies use `SameSite=Lax` locally and `SameSite=None; Secure` in production.
-- State-changing API calls require the exact configured `Origin` and an `X-Requested-With: KnowledgeBase` header. CORS allows credentials only for the configured origin. Cross-site deployments additionally depend on the browser permitting third-party cookies; a same-site frontend/API deployment is preferable.
-- Login is limited to 10 attempts per IP per 15 minutes. The default limiter is process-local and resets on restart; use a shared rate-limit store and edge protections before multi-instance production deployment. Set `TRUST_PROXY=1` only behind exactly one trusted reverse proxy; incorrect proxy settings can undermine IP-based limits.
-- `NODE_ENV=production` requires an HTTPS `CORS_ORIGIN`. HTTPS is required for secure cookies. Set frontend `VITE_API_BASE_URL` to the backend URL ending in `/api` at build time. Configure the hosting provider to rewrite frontend routes to `index.html`.
-- This foundation is not yet a production-ready knowledge base. Complete Phase 8 security, operations, password recovery, deployment configuration and testing before production.
+- **ADMIN:** manage accounts and roles; cannot remove the last active administrator. Future phases will add category management and article approval.
+- **EDITOR:** authenticated profile access now; article drafting, editing, submission and history are future work.
+- **TECHNICIAN:** authenticated profile access now; published article search, reading, feedback and outdated reports are future work.
 
-## Tests
+The browser never decides authorization. Only verified administrators can create users or change roles; Firestore transactions recheck the administrator and serialize changes to the active-administrator count. Do not edit `users` or `_internal/user_management` manually: their consistency is required for the last-admin safeguard. Protect backend service-account access and deployment credentials.
+
+Firestore client rules deny all direct reads and writes, including `users`, `categories`, `articles`, `article_history`, `feedback`, `article_views`, and `attachments`. The Admin SDK bypasses those rules. Firestore creates collections when their first document is written, so deferred collections are not populated with placeholder documents. Add appropriately scoped rules and server-side authorization before implementing those features.
+
+Firebase's Email/Password provider may permit someone to create an Auth account directly through Firebase's public endpoints. Such an account has no application profile or role and cannot use protected API routes or Firestore. There is no public application registration or administrator bootstrap endpoint. Restrict Firebase API keys to the intended APIs and monitor Auth account creation and quotas; blocking sign-ups at the identity provider may require features outside the free tier.
+
+Firebase does not automatically migrate existing PostgreSQL users or passwords. Back up any existing database and plan a separate controlled migration before switching an existing installation. No PostgreSQL data is deleted by this application.
+
+## Tests and verification
 
 ```powershell
 npm test
 npm run build
 ```
 
-The default tests exercise authentication, roles, user management, session expiry/revocation, CSRF checks and rate limiting using a database test double. They do not prove PostgreSQL integration. For a real database test, use a **disposable** PostgreSQL database and a role allowed to create and drop schemas:
-
-```powershell
-$env:TEST_DATABASE_URL = Read-Host "Disposable PostgreSQL connection string"
-npm run test:integration --workspace backend
-Remove-Item Env:TEST_DATABASE_URL
-```
-
-The integration test creates a uniquely named schema, runs migrations and setup inside it, exercises all three roles, then drops that schema. It does not modify existing tables. Until this test and a live sign-in are run against your configured database, the database-dependent workflow remains unverified.
+The tests cover all three roles, rejected tokens and role escalation, administrator changes, bootstrap, deactivation and the last-admin invariant using test doubles. They do **not** validate actual Firebase Authentication, Firestore transactions or deployed Security Rules. Before deployment, run live or Firebase Emulator Suite checks for registration, login, persistence, logout, reset email, all roles, unauthorized API and direct Firestore access, concurrent administrator changes, and deactivation/reactivation. Verify that rules are published to the intended project. No production readiness is implied until those checks pass.
