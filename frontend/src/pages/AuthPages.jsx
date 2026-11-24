@@ -22,7 +22,8 @@ export function Login() {
       navigate(location.state?.from || '/', { replace: true });
     } catch (failure) {
       if (failure.response?.data?.code === 'ACCOUNT_DISABLED') navigate('/account-disabled');
-      else setError(failure.response?.data?.error || 'Unable to sign in. Check your connection and try again.');
+      else if (failure.code === 'auth/user-disabled') navigate('/account-disabled');
+      else setError(failure.response?.data?.error || 'Unable to sign in. Check your credentials and connection, then try again.');
     } finally {
       setBusy(false);
     }
@@ -36,8 +37,41 @@ export function Login() {
         {error && <p className="error" role="alert">{error}</p>}
         <button className="button w-full" disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
       </form>
+      <Link className="link mt-4 inline-block" to="/reset-password">Forgot password?</Link>
     </section>
   </div></main>;
+}
+
+export function ResetPassword() {
+  const { resetPassword } = useAuth();
+  const [email, setEmail] = useState('');
+  const [error, setError] = useState('');
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      await resetPassword(email);
+      setSent(true);
+    } catch (failure) {
+      if (failure.code === 'auth/user-not-found') setSent(true);
+      else setError('Could not send the reset request. Check the email and try again.');
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <main className="flex min-h-screen items-center justify-center bg-[#f5f6f8] p-6"><section className="card w-full max-w-md">
+    <p className="eyebrow">Service Desk</p><h1 className="mt-2 text-2xl font-semibold">Reset password</h1>
+    {sent ? <p className="mt-4 text-sm">If an account exists for that address, check your email for reset instructions.</p> :
+      <form className="mt-6 space-y-4" onSubmit={submit}>
+        <label className="field">Email address<input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+        {error && <p className="error" role="alert">{error}</p>}
+        <button className="button w-full" disabled={busy}>{busy ? 'Sending...' : 'Send reset link'}</button>
+      </form>}
+    <Link className="link mt-5 inline-block" to="/login">Return to sign in</Link>
+  </section></main>;
 }
 
 export function MessagePage({ disabled = false }) {
