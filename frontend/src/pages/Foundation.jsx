@@ -80,10 +80,10 @@ export default function Foundation() {
               </div>
               <div className="mt-6 divide-y divide-slate-100 border-t border-slate-100" aria-live="polite">
                 <StatusItem icon={Activity} title="API service" description="Express server availability" state={status.api} />
-                <StatusItem icon={Database} title="PostgreSQL database" description="Connection to your configured database" state={status.database} />
+                <StatusItem icon={Database} title="Cloud Firestore" description="Connection to your configured database" state={status.database} />
               </div>
               {status.api === 'error' && <p className="rounded-lg bg-amber-50 p-3 text-sm leading-6 text-amber-900">The API is unavailable. Start the backend and check its configured URL.</p>}
-              {status.api === 'ready' && status.database === 'error' && <p className="rounded-lg bg-amber-50 p-3 text-sm leading-6 text-amber-900">Database unavailable. Configure DATABASE_URL in the backend environment and check the server logs.</p>}
+              {status.api === 'ready' && status.database === 'error' && <p className="rounded-lg bg-amber-50 p-3 text-sm leading-6 text-amber-900">Firestore unavailable. Check backend Firebase configuration and server logs.</p>}
             </section>
             <section className="rounded-2xl bg-[#204c43] p-6 text-white shadow-sm md:p-8">
               <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10"><BookOpen size={21} /></div>
@@ -93,7 +93,7 @@ export default function Foundation() {
               <div className="mt-8 space-y-4 border-t border-white/15 pt-6 text-sm text-emerald-50/90">
                 <div className="flex items-center gap-3"><Check size={16} className="text-emerald-200" /> React and Tailwind interface</div>
                 <div className="flex items-center gap-3"><Check size={16} className="text-emerald-200" /> Express API foundation</div>
-                <div className="flex items-center gap-3"><ArrowRight size={16} className="text-emerald-200" /> Configure your Neon database</div>
+                <div className="flex items-center gap-3"><ArrowRight size={16} className="text-emerald-200" /> Configure your Firebase project</div>
               </div>
             </section>
           </div>
