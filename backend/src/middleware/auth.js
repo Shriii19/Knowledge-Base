@@ -1,29 +1,26 @@
-import jwt from 'jsonwebtoken';
-import { z } from 'zod';
+import { role } from '../validators/user.js';
 
-export function authentication(database, secret) {
+export function authentication(identity, store) {
   return async (req, res, next) => {
-    const token = req.cookies.kb_session;
-    if (!token) return res.status(401).json({ error: 'Authentication required' });
-    let payload;
+    const match = /^Bearer ([^\s]+)$/.exec(req.get('Authorization') || '');
+    if (!match) return res.status(401).json({ error: 'Authentication required' });
+    let token;
     try {
-      payload = jwt.verify(token, secret, { algorithms: ['HS256'], issuer: 'kb-api', audience: 'kb-web' });
-      if (typeof payload !== 'object' || !z.uuid().safeParse(payload.sub).success || !z.uuid().safeParse(payload.jti).success) throw new Error('Invalid token');
-    } catch {
+      token = await identity.verifyIdToken(match[1], true);
+    } catch (error) {
+      if (['auth/argument-error', 'auth/id-token-expired', 'auth/id-token-revoked',
+        'auth/invalid-id-token', 'auth/user-disabled', 'auth/user-not-found'].includes(error.code)) {
+        return res.status(401).json({ error: 'Session expired or invalid' });
+      }
+      return next(error);
+    }
+    const user = await store.getUser(token.uid);
+    if (!user || !role.safeParse(user.role).success) return res.status(403).json({ error: 'Access denied' });
+    if (!user.is_active) return res.status(403).json({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
+    if (user.sessions_valid_after && token.auth_time <= user.sessions_valid_after) {
       return res.status(401).json({ error: 'Session expired or invalid' });
     }
-    const result = await database.query(
-      `SELECT u.id, u.full_name, u.email, u.role, u.is_active, u.created_at, u.last_login_at, s.id AS session_id
-       FROM users u LEFT JOIN auth_sessions s ON s.user_id = u.id AND s.id = $2 AND s.expires_at > now()
-       WHERE u.id = $1`,
-      [payload.sub, payload.jti]
-    );
-    if (!result.rowCount) return res.status(401).json({ error: 'Session expired or invalid' });
-    if (!result.rows[0].is_active) return res.status(403).json({ error: 'Account disabled', code: 'ACCOUNT_DISABLED' });
-    if (!result.rows[0].session_id) return res.status(401).json({ error: 'Session expired or invalid' });
-    const { session_id, ...user } = result.rows[0];
-    req.user = user;
-    req.sessionId = payload.jti;
+    req.user = { ...user, last_login_at: new Date(token.auth_time * 1000).toISOString() };
     next();
   };
 }
