@@ -2,7 +2,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import Workspace from './layouts/Workspace';
-import { Login, MessagePage } from './pages/AuthPages';
+import { Login, MessagePage, ResetPassword } from './pages/AuthPages';
 import { Overview, Profile } from './pages/Overview';
 import { CreateUser, Users } from './pages/Users';
 import Foundation from './pages/Foundation';
@@ -10,6 +10,7 @@ import Foundation from './pages/Foundation';
 export default function App() {
   return <BrowserRouter><AuthProvider><Routes>
     <Route path="/login" element={<Login />} />
+    <Route path="/reset-password" element={<ResetPassword />} />
     <Route path="/account-disabled" element={<MessagePage disabled />} />
     <Route element={<ProtectedRoute />}>
       <Route path="/unauthorized" element={<MessagePage />} />
